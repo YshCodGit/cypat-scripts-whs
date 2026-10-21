@@ -4,66 +4,64 @@ on:
   pull_request:
     branches: [ main ]
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  verify-and-merge:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Enforce Folder and Ownership Rules
-        id: rule_check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          git fetch origin main:main
-          
-          # Get list of modified, added, or deleted files in this PR
-          CHANGED_FILES=$(git diff --name-only main...HEAD)
-          PR_AUTHOR_EMAIL="${{ github.event.pull_request.user.login }}@://github.com"
-          GIT_AUTHOR_EMAIL=$(git log -1 --pretty=format:'%ae')
-          
           VIOLATIONS=0
-          
-          for file in $CHANGED_FILES; do
-            echo "Analyzing path: $file"
-            
-            # --- RULE 1: FOLDER RESTRICTION ---
-            # Check if the file sits outside the authorized CyPat directories
-            if [[ ! "$file" =~ ^(cisco/|mint/|windows/|ubuntu/|linux/) ]]; then
-              echo "❌ ERROR: You cannot modify '$file'. Submissions are strictly limited to cisco/, mint/, windows/, ubuntu/, and linux/ folders."
+
+          while IFS= read -r file; do
+            echo "Analyzing: $file"
+
+            if [[ ! "$file" =~ ^(cisco|mint|windows|ubuntu|linux)/ ]]; then
+              echo "::error::Cannot modify '$file'. Only cisco/, mint/, windows/, ubuntu/, linux/ allowed."
               VIOLATIONS=$((VIOLATIONS+1))
               continue
             fi
-            
-            # --- RULE 2: OWNERSHIP RESTRICTION ---
-            # Ignore brand new files (Anyone can create a new script inside the safe folders)
-            if ! git cat-file -e "main:$file" 2>/dev/null; then
-              echo "✅ '$file' is a brand new script. Allowed."
+
+            if ! git cat-file -e "$BASE_SHA:$file" 2>/dev/null; then
+              echo "New file: $file"
               continue
             fi
-            
-            # Find the original creator of the file to protect it
-            ORIGINAL_CREATOR_EMAIL=$(git log --follow --format='%ae' "$file" | tail -n 1)
-            ORIGINAL_CREATOR_NAME=$(git log --follow --format='%an' "$file" | tail -n 1)
-            
-            if [ "$GIT_AUTHOR_EMAIL" != "$ORIGINAL_CREATOR_EMAIL" ] && [ "$PR_AUTHOR_EMAIL" != "$ORIGINAL_CREATOR_EMAIL" ]; then
-              echo "❌ ERROR: You cannot edit '$file'. It belongs to $ORIGINAL_CREATOR_NAME."
+
+            FIRST_SHA=$(git log "$BASE_SHA" --follow --format='%H' -- "$file" | tail -n 1)
+            OWNER=$(gh api "repos/$REPO/commits/$FIRST_SHA" --jq '.author.login')
+
+            if [ "$OWNER" != "$PR_AUTHOR" ]; then
+              echo "::error::Cannot edit '$file'. It belongs to $OWNER."
               VIOLATIONS=$((VIOLATIONS+1))
             else
-              echo "✅ Ownership match found. You are allowed to edit '$file'."
+              echo "Ownership match: $file"
             fi
-          done
-          
-          if [ $VIOLATIONS -gt 0 ]; then
-            echo "Submission rejected due to rule violations."
+          done < <(git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA")
+
+          if [ "$VIOLATIONS" -gt 0 ]; then
+            echo "Submission rejected."
             exit 1
           fi
 
-      - name: Automatically Merge into Main
-        if: success()
-        uses: pascalgn/automerge-action@v0.16.4
+  merge:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: pascalgn/automerge-action@v0.16.4
         env:
           GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
           MERGE_METHOD: "squash"
-          MERGE_LABELS: "" 
+          MERGE_LABELS: ""
